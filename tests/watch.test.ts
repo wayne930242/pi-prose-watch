@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AI_THRESHOLD, addedText, canonical, chunksOf, createProseWatch, ENTRY_TYPE, type Judge, type Judgement, proseOf } from "../src/index.ts";
@@ -104,7 +104,10 @@ test("the armed path matches however pi's write spells it", async () => {
 	for (const spelling of ["@post.md", "./post.md", `${dir}//post.md`, "~/post.md", join(dir, "sub", "..", "post.md")]) {
 		assert.ok(await h.result("write", { path: spelling, content: PROSE }), spelling);
 	}
-	assert.equal(canonical("/tmp", "a.md"), canonical("/private/tmp", "a.md"));
+	// A symlinked directory (macOS /tmp -> /private/tmp) resolves to its target, even before the file exists.
+	mkdirSync(join(dir, "real"));
+	symlinkSync(join(dir, "real"), join(dir, "link"));
+	assert.equal(canonical(dir, "link/a.md"), canonical(dir, "real/a.md"));
 	assert.equal(canonical("/x", "~", "/no-such-root/u"), "/no-such-root/u");
 });
 

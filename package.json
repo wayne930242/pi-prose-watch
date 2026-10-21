@@ -1,6 +1,6 @@
 {
   "name": "pi-prose-watch",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "An AI-tone check for pi that runs only while the agent drafts prose: arm a file with prose_watch, and every write or edit to it is judged by Jev, with a likely-AI verdict attached to the tool result",
   "type": "module",
   "license": "MIT",
