@@ -8,7 +8,8 @@
  * the sentences stays with the agent's own polishing rules.
  */
 
-import { isAbsolute, resolve } from "node:path";
+import { realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 
@@ -17,7 +18,9 @@ export const TOOL_NAME = "prose_watch";
 // 0.25–0.55, four stock AI paragraphs 0.80–0.92; one AI paragraph in a translated register scored 0.56.
 export const AI_THRESHOLD = 0.7;
 export const MIN_CHARS = 40;
-const MAX_CHARS = 6000;
+const CHUNK_CHARS = 6000;
+const MAX_CHUNKS = 4;
+export const ENTRY_TYPE = "prose-watch";
 const TIMEOUT_MS = 10_000;
 
 export const QUESTIONS = {
@@ -64,19 +67,21 @@ export function jevJudge(env: NodeJS.ProcessEnv = process.env): Judge {
 	return async (text, signal) => {
 		const apiKey = env.TYPESAFE_API_KEY;
 		if (!apiKey) throw new Error("TYPESAFE_API_KEY is not set");
-		const baseUrl = (env.TYPESAFE_BASE_URL ?? "https://api.typesafe.ai").replace(/\/+$/, "");
-		const response = await fetch(`${baseUrl}/v1/systemone`, {
+		// Same form as pi's typesafe provider: the base ends at /v1/ and the endpoint is appended.
+		const baseUrl = `${(env.TYPESAFE_BASE_URL ?? "https://api.typesafe.ai/v1").replace(/\/+$/, "")}/`;
+		const response = await fetch(new URL("systemone", baseUrl), {
 			method: "POST",
 			headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", Accept: "application/json" },
 			body: JSON.stringify({ state: { text }, questions: WIRE_QUESTIONS, model: env.TYPESAFE_DEFAULT_MODEL ?? "jev-latest" }),
 			signal,
 		});
-		if (!response.ok) throw new Error(`TypeSafe ${response.status}: ${(await response.text()).slice(0, 200)}`);
+		// Provider text stays out of the model's context: errors carry only the status.
+		if (!response.ok) throw new Error(`TypeSafe returned HTTP ${response.status}`);
 		const answers = ((await response.json()) as { answers?: Answers }).answers;
 		const ai = answers?.ai?.noul;
 		const tell = answers?.tell?.choice;
 		if (typeof ai !== "number" || !tell || !(tell in QUESTIONS.tell.criteria)) {
-			throw new Error(`unexpected TypeSafe answer: ${JSON.stringify(answers).slice(0, 200)}`);
+			throw new Error("TypeSafe returned an answer without the expected fields");
 		}
 		return { ai, tell: tell as Tell };
 	};
@@ -106,10 +111,44 @@ export function proseOf(text: string): string {
 		.trim();
 }
 
-export function warning(path: string, judgement: Judgement): string {
+/** Splits prose at paragraph breaks into chunks of at most CHUNK_CHARS, cutting a longer paragraph. */
+export function chunksOf(prose: string): string[] {
+	const chunks: string[] = [];
+	let current = "";
+	for (const paragraph of prose.split(/\n{2,}/)) {
+		for (let start = 0; start < paragraph.length; start += CHUNK_CHARS) {
+			const piece = paragraph.slice(start, start + CHUNK_CHARS);
+			if (current && current.length + 2 + piece.length > CHUNK_CHARS) {
+				chunks.push(current);
+				current = "";
+			}
+			current = current ? `${current}\n\n${piece}` : piece;
+		}
+	}
+	if (current) chunks.push(current);
+	return chunks;
+}
+
+/** pi's own path rules (a leading @ dropped, ~ expanded, resolved against cwd), then symlinks followed. */
+export function canonical(cwd: string, path: string, home = process.env.HOME ?? "~"): string {
+	const cleaned = path.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ").replace(/^@/, "");
+	const expanded = cleaned === "~" ? home : cleaned.replace(/^~(?=\/)/, home);
+	const absolute = resolve(isAbsolute(expanded) ? expanded : join(cwd, expanded));
+	try {
+		return realpathSync(absolute);
+	} catch {
+		try {
+			return join(realpathSync(dirname(absolute)), basename(absolute));
+		} catch {
+			return absolute;
+		}
+	}
+}
+
+export function warning(path: string, judgement: Judgement, excerpt: string): string {
 	const tell = judgement.tell === "none" ? "no single pattern stands out" : `most visibly ${QUESTIONS.tell.criteria[judgement.tell]}`;
 	return (
-		`prose_watch (Jev, advisory): the text this call added to ${path} reads AI-written ` +
+		`prose_watch (Jev, advisory): text this call added to ${path}, in the passage starting 「${excerpt}」, reads AI-written ` +
 		`(${judgement.ai.toFixed(2)}); ${tell}. Reread those sentences against your AI-tone rules ` +
 		"(the AI-tone scan in polishing-prose, when you have it) and rewrite them before going on."
 	);
@@ -123,13 +162,21 @@ const PARAMS = Type.Object(
 	{ additionalProperties: false },
 );
 
+type Text = { type: "text"; text: string };
+type Entry = { type?: string; customType?: string; data?: { watched?: unknown } };
+
 export function createProseWatch(judge: Judge, env: NodeJS.ProcessEnv = process.env) {
 	return function (pi: ExtensionAPI) {
 		const watched = new Set<string>();
-		const absolute = (cwd: string, path: string) => (isAbsolute(path) ? path : resolve(cwd, path.replace(/^~(?=\/)/, env.HOME ?? "~")));
+		const home = env.HOME ?? "~";
 
-		pi.on("session_start", () => {
+		// The armed set is saved in the session, so /reload, resume, and fork keep what the transcript says is armed.
+		pi.on("session_start", (_event, ctx) => {
 			watched.clear();
+			const entries = ctx.sessionManager.getBranch() as Entry[];
+			const last = entries.filter((entry) => entry.type === "custom" && entry.customType === ENTRY_TYPE).at(-1);
+			const saved = last?.data?.watched;
+			if (Array.isArray(saved)) for (const path of saved) if (typeof path === "string") watched.add(path);
 		});
 
 		pi.registerTool({
@@ -144,7 +191,7 @@ export function createProseWatch(judge: Judge, env: NodeJS.ProcessEnv = process.
 			],
 			parameters: PARAMS,
 			async execute(_toolCallId: string, params: Static<typeof PARAMS>, _signal: unknown, _onUpdate: unknown, ctx: { cwd: string }) {
-				const paths = (params.paths ?? []).map((path) => absolute(ctx.cwd, path));
+				const paths = (params.paths ?? []).map((path) => canonical(ctx.cwd, path, home));
 				if (params.action === "on") {
 					if (paths.length === 0) throw new Error("prose_watch on needs at least one path");
 					if (!env.TYPESAFE_API_KEY) throw new Error("TYPESAFE_API_KEY is not set, so Jev cannot judge; nothing was armed");
@@ -155,6 +202,7 @@ export function createProseWatch(judge: Judge, env: NodeJS.ProcessEnv = process.
 					for (const path of paths) watched.delete(path);
 				}
 				const list = [...watched];
+				pi.appendEntry(ENTRY_TYPE, { watched: list });
 				return {
 					content: [{ type: "text" as const, text: list.length > 0 ? `Watching:\n${list.join("\n")}` : "Watching no files." }],
 					details: { watched: list },
@@ -163,22 +211,34 @@ export function createProseWatch(judge: Judge, env: NodeJS.ProcessEnv = process.
 		});
 
 		pi.on("tool_result", async (event, ctx) => {
-			if (watched.size === 0) return;
-			const path = typeof event.input.path === "string" ? absolute(ctx.cwd, event.input.path) : undefined;
+			// A nested call's result reaches only its parent's record, never the model, so judging it is wasted.
+			if (watched.size === 0 || event.parentToolCallId) return;
+			const path = typeof event.input.path === "string" ? canonical(ctx.cwd, event.input.path, home) : undefined;
 			if (!path || !watched.has(path)) return;
 			const added = addedText(event);
 			if (added === undefined) return;
 			const prose = proseOf(added);
 			if (prose.length < MIN_CHARS) return;
-			let judgement: Judgement;
+			const chunks = chunksOf(prose);
+			const judged = chunks.slice(0, MAX_CHUNKS);
+			const signal = AbortSignal.any([AbortSignal.timeout(TIMEOUT_MS), ...(ctx.signal ? [ctx.signal] : [])]);
+			const notes: Text[] = [];
+			let results: Judgement[];
 			try {
-				judgement = await judge(prose.slice(0, MAX_CHARS), AbortSignal.timeout(TIMEOUT_MS));
+				results = await Promise.all(judged.map((chunk) => judge(chunk, signal)));
 			} catch (error) {
+				if (ctx.signal?.aborted) return;
 				const reason = error instanceof Error ? error.message : String(error);
 				return { content: [...event.content, { type: "text" as const, text: `prose_watch: Jev check failed, this change was not judged: ${reason}` }] };
 			}
-			if (judgement.ai < AI_THRESHOLD) return;
-			return { content: [...event.content, { type: "text" as const, text: warning(path, judgement) }] };
+			const worst = results.reduce((top, result, index) => (result.ai > results[top].ai ? index : top), 0);
+			if (results[worst].ai >= AI_THRESHOLD) notes.push({ type: "text", text: warning(path, results[worst], judged[worst].slice(0, 20)) });
+			if (chunks.length > judged.length) {
+				const chars = judged.reduce((sum, chunk) => sum + chunk.length, 0);
+				notes.push({ type: "text", text: `prose_watch: only the first ${chars} of ${prose.length} characters were judged; write long text in smaller calls to have all of it checked.` });
+			}
+			if (notes.length === 0) return;
+			return { content: [...event.content, ...notes] };
 		});
 	};
 }

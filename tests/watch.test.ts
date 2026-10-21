@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { AI_THRESHOLD, addedText, createProseWatch, type Judge, type Judgement, proseOf } from "../src/index.ts";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { AI_THRESHOLD, addedText, canonical, chunksOf, createProseWatch, ENTRY_TYPE, type Judge, type Judgement, proseOf } from "../src/index.ts";
 
 const PROSE = "小安約小華看電影，自己遲到半小時，小華很生氣。小安為什麼遲到？硬要說原因有好幾個，但這些原因都不是道歉的重點。";
 
 // Registers the extension against a minimal pi; `judge` stands in for Jev and records what it was sent.
-function harness(verdict: Judgement | Error, env: NodeJS.ProcessEnv = { TYPESAFE_API_KEY: "k", HOME: "/home/u" }) {
+function harness(verdict: Judgement | Error, env: NodeJS.ProcessEnv = { TYPESAFE_API_KEY: "k", HOME: "/home/u" }, cwd = "/repo") {
 	const sent: string[] = [];
+	const entries: { type: string; customType: string; data: unknown }[] = [];
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
 	let tool: ToolDefinition | undefined;
 	const judge: Judge = async (text) => {
@@ -20,16 +24,18 @@ function harness(verdict: Judgement | Error, env: NodeJS.ProcessEnv = { TYPESAFE
 			tool = definition;
 		},
 		on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => handlers.set(event, handler),
+		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
 	} as unknown as ExtensionAPI;
 	createProseWatch(judge, env)(pi);
-	const ctx = { cwd: "/repo" };
+	const ctx: { cwd: string; signal?: AbortSignal; sessionManager: { getBranch: () => unknown[] } } = { cwd, sessionManager: { getBranch: () => entries } };
 	const watch = (params: Record<string, unknown>) =>
 		(tool as unknown as { execute: (...args: unknown[]) => Promise<{ content: { text: string }[] }> }).execute("t1", params, undefined, undefined, ctx);
-	const result = (toolName: string, input: Record<string, unknown>, isError = false) =>
-		handlers.get("tool_result")?.({ type: "tool_result", toolName, input, isError, content: [{ type: "text", text: "ok" }] }, ctx) as Promise<
+	const result = (toolName: string, input: Record<string, unknown>, isError = false, extra: Record<string, unknown> = {}) =>
+		handlers.get("tool_result")?.({ type: "tool_result", toolName, input, isError, content: [{ type: "text", text: "ok" }], ...extra }, ctx) as Promise<
 			{ content: { text: string }[] } | undefined
 		>;
-	return { sent, watch, result, handlers };
+	const restart = () => handlers.get("session_start")?.({ type: "session_start", reason: "reload" }, ctx);
+	return { sent, watch, result, handlers, entries, ctx, restart };
 }
 
 const likely: Judgement = { ai: AI_THRESHOLD + 0.1, tell: "filler" };
@@ -40,7 +46,7 @@ test("an armed file's write is judged, and a likely-AI verdict is appended to th
 	const out = await h.result("write", { path: "/repo/drafts/post.md", content: PROSE });
 	assert.deepEqual(h.sent, [PROSE]);
 	assert.equal(out?.content[0]?.text, "ok");
-	assert.match(out?.content[1]?.text ?? "", /reads AI-written \(0\.80\); most visibly stock transitions/);
+	assert.match(out?.content[1]?.text ?? "", /passage starting 「小安約小華看電影，自己遲到半小時，小華很」, reads AI-written \(0\.80\); most visibly stock transitions/);
 });
 
 test("an edit sends only the replacement text, never the whole file", async () => {
@@ -80,11 +86,48 @@ test("off disarms the given paths, or every path without any", async () => {
 	assert.equal(h.sent.length, 0);
 });
 
-test("a new session starts with nothing armed", async () => {
+test("reload, resume, and fork keep what the session saved; a new session's empty branch arms nothing", async () => {
 	const h = harness(likely);
 	await h.watch({ action: "on", paths: ["post.md"] });
-	h.handlers.get("session_start")?.({}, {});
+	assert.deepEqual(h.entries.at(-1), { type: "custom", customType: ENTRY_TYPE, data: { watched: ["/repo/post.md"] } });
+	h.restart();
+	assert.ok(await h.result("write", { path: "/repo/post.md", content: PROSE }));
+	h.entries.length = 0;
+	h.restart();
 	assert.equal(await h.result("write", { path: "/repo/post.md", content: PROSE }), undefined);
+});
+
+test("the armed path matches however pi's write spells it", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pw-"));
+	const h = harness(likely, { TYPESAFE_API_KEY: "k", HOME: dir }, dir);
+	await h.watch({ action: "on", paths: ["post.md"] });
+	for (const spelling of ["@post.md", "./post.md", `${dir}//post.md`, "~/post.md", join(dir, "sub", "..", "post.md")]) {
+		assert.ok(await h.result("write", { path: spelling, content: PROSE }), spelling);
+	}
+	assert.equal(canonical("/tmp", "a.md"), canonical("/private/tmp", "a.md"));
+	assert.equal(canonical("/x", "~", "/no-such-root/u"), "/no-such-root/u");
+});
+
+test("long text is judged in chunks, and a cut is stated", async () => {
+	const paragraph = "甲".repeat(5000);
+	assert.deepEqual(chunksOf(`${paragraph}\n\n${paragraph}`).map((c) => c.length), [5000, 5000]);
+	assert.deepEqual(chunksOf("乙".repeat(13000)).map((c) => c.length), [6000, 6000, 1000]);
+	const h = harness({ ai: 0.9, tell: "contrast" });
+	await h.watch({ action: "on", paths: ["post.md"] });
+	const out = await h.result("write", { path: "/repo/post.md", content: Array(6).fill(paragraph).join("\n\n") });
+	assert.equal(h.sent.length, 4);
+	assert.match(out?.content.at(-1)?.text ?? "", /only the first 20000 of 30010 characters were judged/);
+});
+
+test("a nested call is skipped, and an aborted turn adds nothing", async () => {
+	const h = harness(likely);
+	await h.watch({ action: "on", paths: ["post.md"] });
+	assert.equal(await h.result("write", { path: "/repo/post.md", content: PROSE }, false, { parentToolCallId: "p1" }), undefined);
+	assert.equal(h.sent.length, 0);
+	const aborted = harness(new Error("aborted"));
+	await aborted.watch({ action: "on", paths: ["post.md"] });
+	aborted.ctx.signal = AbortSignal.abort();
+	assert.equal(await aborted.result("write", { path: "/repo/post.md", content: PROSE }), undefined);
 });
 
 test("arming without a TypeSafe key fails instead of watching silently", async () => {
